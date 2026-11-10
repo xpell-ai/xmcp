@@ -1,0 +1,52 @@
+{
+  "name": "@xpell/mcp",
+  "version": "2.0.7",
+  "publishConfig": {
+    "access": "public"
+  },
+  "description": "MCP adapter for Xpell server runtimes.",
+  "files": [
+    "dist",
+    "docs"
+  ],
+  "type": "module",
+  "types": "./dist/index.d.ts",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "test": "npm run build && node --test dist/tests/*.test.js"
+  },
+  "keywords": [
+    "xpell",
+    "mcp",
+    "model-context-protocol"
+  ],
+  "author": "Tamir Fridman <fridman.tamir@gmail.com> (https://github.com/fridman-tamir)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xpell-ai/xpell-node"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/node": "2.0.0",
+    "@modelcontextprotocol/server": "2.0.0",
+    "@xpell/core": "workspace:*",
+    "@xpell/node-core": "workspace:*",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
