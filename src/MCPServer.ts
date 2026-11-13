@@ -275,4 +275,4 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }
 
-const DEFAULT_XMCP_PACKAGE_VERSION = "2.0.7";
+const DEFAULT_XMCP_PACKAGE_VERSION = "2.0.8";
