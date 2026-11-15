@@ -1,5 +1,11 @@
 # @xpell/mcp
 
+## 2.0.8 release candidate
+
+Target publication date: **13 November 2026**; this candidate has not been published.
+Use the coordinated 2.0.8 runtime dependencies. See [CHANGELOG](./CHANGELOG.md)
+for package changes and qualification limits; [LICENSE](./LICENSE) contains the MIT terms.
+
 MCP adapter for Xpell server runtimes.
 
 Current scope:
