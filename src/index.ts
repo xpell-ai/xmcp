@@ -33,6 +33,14 @@ export {
   type XpellMCPToolDefinition,
   type XpellMCPToolSummary,
 } from "./MCPToolRegistry.js";
+export type {
+  XpellMCPDiscoveredOperation,
+  XpellMCPExposureDefinition,
+  XpellMCPExposureLimits,
+  XpellMCPExposureSelection,
+  XpellMCPExposureSelector,
+  XpellMCPExposureView,
+} from "./MCPReadExposure.js";
 export {
   MCPModule,
   MCP_OPS,

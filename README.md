@@ -21,6 +21,9 @@ Current scope:
 - Does not depend on XVibe.
 - Does not implement Xpell as an MCP client.
 
+The [Xpell2MCP v0.2 contract](docs/xpell2mcp-v0.2.md) documents the opt-in,
+host-controlled native read catalog and how to use it with the existing registry.
+
 ## Settings
 
 `@xpell/mcp` uses the existing XSettings store:
