@@ -14,6 +14,7 @@ import {
 import { createXpellMCPWWWAuthenticateChallenge } from "./MCPOAuthMetadata.js";
 import { getXpellMCPRuntimeReadiness } from "./MCPRuntimeReadiness.js";
 import { DefaultMCPToolRegistry, type MCPToolRegistry } from "./MCPToolRegistry.js";
+import type { XpellMCPExposureSelector, XpellMCPExposureView } from "./MCPReadExposure.js";
 
 const require = createRequire(import.meta.url);
 
@@ -32,6 +33,7 @@ export type XpellMCPServerOptions = {
 
 export type XpellMCPRequestHandlerOptions = XpellMCPServerOptions & {
   _settings?: Partial<XpellMCPSettings>;
+  _select_exposure?: XpellMCPExposureSelector;
 };
 
 export type XpellMCPRouteApp = {
@@ -49,7 +51,7 @@ export type XpellMCPMountResult = {
 
 let xpell_mcp_route_status: XpellMCPMountResult | null = null;
 
-export function createXpellMCPServer(options: XpellMCPServerOptions = {}): McpServer {
+export function createXpellMCPServer(options: XpellMCPServerOptions = {}, view?: XpellMCPExposureView): McpServer {
   const package_info = getXpellMCPPackageInfo();
   const server = new McpServer(
     {
@@ -63,7 +65,7 @@ export function createXpellMCPServer(options: XpellMCPServerOptions = {}): McpSe
     },
   );
 
-  (options._registry ?? DefaultMCPToolRegistry).registerWithServer(server);
+  (options._registry ?? DefaultMCPToolRegistry).registerWithServer(server, view);
   return server;
 }
 
@@ -74,7 +76,10 @@ export function createXpellMCPRequestHandler(options: XpellMCPRequestHandlerOpti
   });
 
   const handler = createMcpHandler(
-    () => createXpellMCPServer({ _registry: options._registry }),
+    ({ authInfo }) => createXpellMCPServer({ _registry: options._registry }, {
+      _context: { _auth: authInfo?.extra },
+      _select: options._select_exposure,
+    }),
     {
       legacy: "stateless",
       onerror: (error) => {
@@ -150,9 +155,7 @@ export function createXpellMCPRequestHandler(options: XpellMCPRequestHandlerOpti
     }
 
     const req_with_auth = req as NodeIncomingMessageLike & { auth?: AuthInfo };
-    if (auth._auth) {
-      req_with_auth.auth = auth._auth;
-    }
+    req_with_auth.auth = auth._auth;
 
     await nodeHandler(req_with_auth, res, parsedBody);
   };

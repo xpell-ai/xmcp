@@ -2,6 +2,12 @@ import { McpServer, type CallToolResult, type ServerContext, type ToolAnnotation
 import { _x, XError } from "@xpell/core";
 import { z } from "zod";
 import { toMCPToolError, toMCPToolResult, sanitizeResult } from "./MCPResultMapper.js";
+import {
+  MAX_EXPOSURES, checkReadExposure, compareExposureNames, discoverOperations,
+  exposureInputSchema, normalizeExposureSelection, parseExposureInput, prepareReadExposure,
+  readExposureActor, runReadExposure, type ReadExposure, type XpellMCPExposureDefinition,
+  type XpellMCPExposureSelection, type XpellMCPExposureView,
+} from "./MCPReadExposure.js";
 
 export type XpellMCPPermission = "runtime:read" | "runtime:write";
 
@@ -30,13 +36,67 @@ export type XpellMCPToolSummary = {
 
 export class MCPToolRegistry {
   private readonly tools = new Map<string, XpellMCPToolDefinition>();
+  private readonly exposures = new Map<string, ReadExposure>();
+  private sealed = false;
 
   register(tool: XpellMCPToolDefinition): void {
-    if (this.tools.has(tool._name)) {
-      throw new Error(`MCP tool '${tool._name}' is already registered.`);
-    }
-
+    this.checkRegistration(tool._name);
     this.tools.set(tool._name, tool);
+  }
+
+  discover() {
+    return discoverOperations();
+  }
+
+  expose(definition: XpellMCPExposureDefinition): void {
+    this.checkRegistration(definition._name);
+    if (this.exposures.size >= MAX_EXPOSURES) throw new Error("Native exposure catalog is full.");
+    this.exposures.set(definition._name, prepareReadExposure(definition));
+  }
+
+  seal(): void {
+    this.sealed = true;
+  }
+
+  select(selection: XpellMCPExposureSelection, context: XpellMCPToolContext): readonly Readonly<XpellMCPToolSummary>[] {
+    return Object.freeze(this.selectExposures(selection, readExposureActor(context)).map((tool) =>
+      Object.freeze({ _name: tool._name, _description: tool._description, _permission: tool._permission })
+    ));
+  }
+
+  async invoke(name: string, input: unknown, context: XpellMCPToolContext) {
+    const tool = this.sealed ? this.exposures.get(name) : undefined;
+    if (!tool) throw new XError("E_XMCP_EXPOSURE_UNAVAILABLE", "Native read operation is unavailable.");
+    const actor = readExposureActor(context);
+    if (!actor) throw new XError("E_XMCP_EXPOSURE_FORBIDDEN", "Verified read actor is required.");
+    const result = await runReadExposure(tool, parseExposureInput(tool, input), actor);
+    return result.structuredContent;
+  }
+
+  private checkRegistration(name: string): void {
+    if (this.sealed) throw new Error("MCP tool registry is sealed.");
+    if (this.tools.has(name) || this.exposures.has(name)) {
+      throw new Error(`MCP tool '${name}' is already registered.`);
+    }
+  }
+
+  private selectExposures(selection: XpellMCPExposureSelection, actor: ReturnType<typeof readExposureActor>): ReadExposure[] {
+    if (!this.sealed || !actor) return [];
+    const { groups, tags, limit } = normalizeExposureSelection(selection);
+    const selected: ReadExposure[] = [];
+    const tools = [...this.exposures.values()].sort((a, b) => compareExposureNames(a._name, b._name));
+    for (const tool of tools) {
+      if (selected.length >= limit) break;
+      if (groups.length && !groups.some((group) => tool._groups.includes(group))) continue;
+      if (tags.length && !tags.some((tag) => tool._tags.includes(tag))) continue;
+      try {
+        checkReadExposure(tool, actor);
+        selected.push(tool);
+      } catch {
+        // Unavailable/unauthorized tools do not enter this request's catalog.
+      }
+    }
+    return selected;
   }
 
   listTools(): XpellMCPToolSummary[] {
@@ -49,7 +109,7 @@ export class MCPToolRegistry {
       }));
   }
 
-  registerWithServer(server: McpServer): void {
+  registerWithServer(server: McpServer, view?: XpellMCPExposureView): void {
     for (const tool of this.tools.values()) {
       if (tool._is_available?.() === false) continue;
       server.registerTool(
@@ -73,6 +133,38 @@ export class MCPToolRegistry {
           }
         },
       );
+    }
+    if (!view || !this.sealed || !this.exposures.size) return;
+    const actor = readExposureActor(view._context);
+    if (!actor) return;
+    let selected: ReadExposure[];
+    try {
+      const selection = view._select?.(Object.freeze({ _auth: actor }));
+      if (selection instanceof Promise) {
+        void selection.catch(() => undefined);
+        return;
+      }
+      selected = this.selectExposures(selection === undefined ? {} : selection, actor);
+    } catch {
+      return;
+    }
+    for (const tool of selected) {
+      server.registerTool(tool._name, {
+        description: tool._description,
+        inputSchema: exposureInputSchema(tool),
+        annotations: { readOnlyHint: true },
+      }, async (input, ctx) => {
+        try {
+          const caller = readExposureActor({ _auth: ctx?.http?.authInfo?.extra });
+          if (!caller || Object.keys(caller).length !== Object.keys(actor).length ||
+              Object.entries(actor).some(([key, value]) => caller[key] !== value)) {
+            throw new XError("E_XMCP_EXPOSURE_FORBIDDEN", "Verified read actor is required.");
+          }
+          return await runReadExposure(tool, input, caller);
+        } catch (error) {
+          return toMCPToolError(error);
+        }
+      });
     }
   }
 }
