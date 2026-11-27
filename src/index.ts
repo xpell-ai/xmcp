@@ -40,7 +40,9 @@ export type {
   XpellMCPExposureSelection,
   XpellMCPExposureSelector,
   XpellMCPExposureView,
-} from "./MCPReadExposure.js";
+  XpellMCPPendingPreparation,
+  XpellMCPWritePreparationInput,
+} from "./MCPExposure.js";
 export {
   MCPModule,
   MCP_OPS,

@@ -3,11 +3,11 @@ import { _x, XError } from "@xpell/core";
 import { z } from "zod";
 import { toMCPToolError, toMCPToolResult, sanitizeResult } from "./MCPResultMapper.js";
 import {
-  MAX_EXPOSURES, checkReadExposure, compareExposureNames, discoverOperations,
-  exposureInputSchema, normalizeExposureSelection, parseExposureInput, prepareReadExposure,
-  readExposureActor, runReadExposure, type ReadExposure, type XpellMCPExposureDefinition,
+  MAX_EXPOSURES, checkExposure, compareExposureNames, discoverOperations,
+  exposureInputSchema, hasExposureScope, normalizeExposureSelection, parseExposureInput, prepareExposure,
+  readExposureActor, runExposure, type Exposure, type XpellMCPExposureDefinition,
   type XpellMCPExposureSelection, type XpellMCPExposureView,
-} from "./MCPReadExposure.js";
+} from "./MCPExposure.js";
 
 export type XpellMCPPermission = "runtime:read" | "runtime:write";
 
@@ -36,7 +36,7 @@ export type XpellMCPToolSummary = {
 
 export class MCPToolRegistry {
   private readonly tools = new Map<string, XpellMCPToolDefinition>();
-  private readonly exposures = new Map<string, ReadExposure>();
+  private readonly exposures = new Map<string, Exposure>();
   private sealed = false;
 
   register(tool: XpellMCPToolDefinition): void {
@@ -51,7 +51,13 @@ export class MCPToolRegistry {
   expose(definition: XpellMCPExposureDefinition): void {
     this.checkRegistration(definition._name);
     if (this.exposures.size >= MAX_EXPOSURES) throw new Error("Native exposure catalog is full.");
-    this.exposures.set(definition._name, prepareReadExposure(definition));
+    const tool = prepareExposure(definition);
+    for (const existing of this.exposures.values()) {
+      if (existing._module === tool._module && existing._op === tool._op && existing._effect !== tool._effect) {
+        throw new Error("Native exposure target cannot have conflicting effects.");
+      }
+    }
+    this.exposures.set(tool._name, tool);
   }
 
   seal(): void {
@@ -68,8 +74,10 @@ export class MCPToolRegistry {
     const tool = this.sealed ? this.exposures.get(name) : undefined;
     if (!tool) throw new XError("E_XMCP_EXPOSURE_UNAVAILABLE", "Native read operation is unavailable.");
     const actor = readExposureActor(context);
-    if (!actor) throw new XError("E_XMCP_EXPOSURE_FORBIDDEN", "Verified read actor is required.");
-    const result = await runReadExposure(tool, parseExposureInput(tool, input), actor);
+    if (!actor || !hasExposureScope(tool, actor)) {
+      throw new XError("E_XMCP_EXPOSURE_FORBIDDEN", `Verified ${tool._effect} actor is required.`);
+    }
+    const result = await runExposure(tool, parseExposureInput(tool, input), actor);
     return result.structuredContent;
   }
 
@@ -80,17 +88,17 @@ export class MCPToolRegistry {
     }
   }
 
-  private selectExposures(selection: XpellMCPExposureSelection, actor: ReturnType<typeof readExposureActor>): ReadExposure[] {
+  private selectExposures(selection: XpellMCPExposureSelection, actor: ReturnType<typeof readExposureActor>): Exposure[] {
     if (!this.sealed || !actor) return [];
     const { groups, tags, limit } = normalizeExposureSelection(selection);
-    const selected: ReadExposure[] = [];
+    const selected: Exposure[] = [];
     const tools = [...this.exposures.values()].sort((a, b) => compareExposureNames(a._name, b._name));
     for (const tool of tools) {
       if (selected.length >= limit) break;
       if (groups.length && !groups.some((group) => tool._groups.includes(group))) continue;
       if (tags.length && !tags.some((tag) => tool._tags.includes(tag))) continue;
       try {
-        checkReadExposure(tool, actor);
+        checkExposure(tool, actor);
         selected.push(tool);
       } catch {
         // Unavailable/unauthorized tools do not enter this request's catalog.
@@ -136,8 +144,8 @@ export class MCPToolRegistry {
     }
     if (!view || !this.sealed || !this.exposures.size) return;
     const actor = readExposureActor(view._context);
-    if (!actor) return;
-    let selected: ReadExposure[];
+    if (!actor || ![...this.exposures.values()].some((tool) => hasExposureScope(tool, actor))) return;
+    let selected: Exposure[];
     try {
       const selection = view._select?.(Object.freeze({ _auth: actor }));
       if (selection instanceof Promise) {
@@ -152,15 +160,15 @@ export class MCPToolRegistry {
       server.registerTool(tool._name, {
         description: tool._description,
         inputSchema: exposureInputSchema(tool),
-        annotations: { readOnlyHint: true },
+        annotations: { readOnlyHint: tool._effect === "read" },
       }, async (input, ctx) => {
         try {
           const caller = readExposureActor({ _auth: ctx?.http?.authInfo?.extra });
           if (!caller || Object.keys(caller).length !== Object.keys(actor).length ||
               Object.entries(actor).some(([key, value]) => caller[key] !== value)) {
-            throw new XError("E_XMCP_EXPOSURE_FORBIDDEN", "Verified read actor is required.");
+            throw new XError("E_XMCP_EXPOSURE_FORBIDDEN", `Verified ${tool._effect} actor is required.`);
           }
-          return await runReadExposure(tool, input, caller);
+          return await runExposure(tool, input, caller);
         } catch (error) {
           return toMCPToolError(error);
         }

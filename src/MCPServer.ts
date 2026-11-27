@@ -14,7 +14,7 @@ import {
 import { createXpellMCPWWWAuthenticateChallenge } from "./MCPOAuthMetadata.js";
 import { getXpellMCPRuntimeReadiness } from "./MCPRuntimeReadiness.js";
 import { DefaultMCPToolRegistry, type MCPToolRegistry } from "./MCPToolRegistry.js";
-import type { XpellMCPExposureSelector, XpellMCPExposureView } from "./MCPReadExposure.js";
+import type { XpellMCPExposureSelector, XpellMCPExposureView } from "./MCPExposure.js";
 
 const require = createRequire(import.meta.url);
 

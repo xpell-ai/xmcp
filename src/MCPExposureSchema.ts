@@ -13,6 +13,12 @@ const reserved_fields = new Set([
   "state", "tenant_id", "session_id", "connection_id", "role", "roles", "auth_context",
   "request_context", "api_key", "access_token", "password", "constructor", "prototype", "proto", "tojson",
 ]);
+const write_control_fields = new Set([
+  "action_id", "approval", "approval_id", "approve", "approved", "confirm", "confirmation",
+  "confirmation_id", "confirmation_token", "confirmed", "commit", "execute", "idempotency_key",
+  "binding_hash", "conversation_id", "delivery_id", "participant_id", "request_message_id",
+  "requester_participant_id",
+]);
 const supported_checks = new Set([
   "min_length", "max_length", "length_equals", "string_format",
   "number_format", "greater_than", "less_than", "multiple_of",
@@ -20,11 +26,11 @@ const supported_checks = new Set([
 
 type PayloadLimits = { bytes: number; values: number };
 
-export function assertExposureSchema(schema: z.ZodObject): void {
+export function assertExposureSchema(schema: z.ZodObject, write = false): void {
   try {
     if (!(schema instanceof z.ZodObject) || !hasSupportedChecks(schema, 0)) throw new Error();
     const json = z.toJSONSchema(schema, { io: "input" });
-    if (isClosedJSONSchema(json, 0) && Buffer.byteLength(JSON.stringify(json)) <= 16384) return;
+    if (isClosedJSONSchema(json, 0, write) && Buffer.byteLength(JSON.stringify(json)) <= 16384) return;
   } catch {
     // Some Zod schemas cannot be represented as the MCP input contract.
   }
@@ -45,18 +51,18 @@ function hasSupportedChecks(schema: unknown, depth: number): boolean {
     schema instanceof z.ZodEnum || schema instanceof z.ZodLiteral || schema instanceof z.ZodNull;
 }
 
-function isClosedJSONSchema(schema: unknown, depth: number): boolean {
+function isClosedJSONSchema(schema: unknown, depth: number, write: boolean): boolean {
   if (!isPlainRecord(schema) || depth > MAX_DEPTH) return false;
   switch (schema.type) {
     case "object": {
       if (schema.additionalProperties !== false || !isPlainRecord(schema.properties)) return false;
       const fields = Object.entries(schema.properties);
       return fields.length <= MAX_FIELDS && fields.every(([key, child]) =>
-        isExposureField(key) && isClosedJSONSchema(child, depth + 1)
+        isExposureField(key, write) && isClosedJSONSchema(child, depth + 1, write)
       );
     }
     case "array":
-      return isBoundedInteger(schema.maxItems, MAX_ITEMS) && isClosedJSONSchema(schema.items, depth + 1);
+      return isBoundedInteger(schema.maxItems, MAX_ITEMS) && isClosedJSONSchema(schema.items, depth + 1, write);
     case "string":
       if (isBoundedInteger(schema.maxLength, MAX_STRING_LENGTH)) return true;
       if (typeof schema.const === "string") return schema.const.length <= MAX_STRING_LENGTH;
@@ -76,9 +82,10 @@ export function isBoundedInteger(value: unknown, max: number): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= max;
 }
 
-function isExposureField(key: string): boolean {
+function isExposureField(key: string, write: boolean): boolean {
+  const name = key.replace(/^_+/, "").toLowerCase();
   return /^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/.test(key) &&
-    !reserved_fields.has(key.replace(/^_+/, "").toLowerCase());
+    !reserved_fields.has(name) && (!write || !write_control_fields.has(name));
 }
 
 export function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -87,7 +94,7 @@ export function isPlainRecord(value: unknown): value is Record<string, unknown> 
   return prototype === Object.prototype || prototype === null;
 }
 
-export function isBoundedExposurePayload(value: unknown, limits: PayloadLimits): value is Record<string, unknown> {
+export function isBoundedExposurePayload(value: unknown, limits: PayloadLimits, write = false): value is Record<string, unknown> {
   let remaining = limits.values;
   let characters = 0;
 
@@ -113,7 +120,7 @@ export function isBoundedExposurePayload(value: unknown, limits: PayloadLimits):
     if (!isPlainRecord(node) || keys.length > MAX_FIELDS) return false;
     for (const key of keys) {
       const field = Object.getOwnPropertyDescriptor(node, key);
-      if (!isExposureField(key) || !field?.enumerable ||
+      if (!isExposureField(key, write) || !field?.enumerable ||
           !("value" in field) || !visit(field.value, depth + 1)) return false;
     }
     return true;

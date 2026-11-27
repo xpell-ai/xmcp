@@ -7,7 +7,7 @@ import { z } from "zod";
 import {
   MCPToolRegistry, createXpellMCPRequestHandler, markXpellMCPRuntimeReady,
   markXpellMCPRuntimeStarting, type XpellMCPExposureDefinition, type XpellMCPExposureSelector,
-  type XpellMCPToolContext,
+  type XpellMCPToolContext, type XpellMCPWritePreparationInput,
 } from "../index.js";
 
 const INPUT = z.strictObject({
@@ -38,6 +38,7 @@ class HiddenCatalogMethods extends XModule {
 
 class TestCatalog extends HiddenCatalogMethods {
   calls: XCommand[] = [];
+  products = new Map<string, unknown>();
   state = true;
   outcome: "success" | "failure" | "response-error" | "throw" | "slow" | "large" = "success";
   pause?: (actor: string) => Promise<void>;
@@ -72,6 +73,16 @@ class TestCatalog extends HiddenCatalogMethods {
   _change_catalog() {
     throw new Error("A write must never be invoked");
   }
+
+  _add_product(command: XCommand) {
+    const { resource_id, product_name } = command._params ?? {};
+    this.calls.push(command);
+    this.products.set(String(resource_id), product_name);
+  }
+
+  _get_product(command: XCommand) {
+    return { title: this.products.get(String(command._params?.resource_id)) ?? "missing" };
+  }
 }
 
 class TestReadAuth extends XModule {
@@ -81,6 +92,9 @@ class TestReadAuth extends XModule {
 
   _authorize_req(command: XCommand) {
     const token = command._params?._token;
+    if (token === "north-write" || token === "south-write") {
+      return { ...actor(token.slice(0, -6))._auth, _auth_type: "fixture", scope: "xpell:write" };
+    }
     if (token !== "north" && token !== "south" && token !== "no-read") return { _authenticated: false };
     return {
       ...actor(token)._auth,
@@ -155,7 +169,7 @@ test("discovery describes hidden methods without exposing them; empty and unseal
 
 test("registration rejects missing targets, wildcard, write permission, invalid schemas and duplicate names", async (t) => {
   const { registry, definition } = await fixture(t);
-  const invalid: [Partial<XpellMCPExposureDefinition>, RegExp][] = [
+  const invalid: [Partial<Extract<XpellMCPExposureDefinition, { _effect: "read" }>>, RegExp][] = [
     [{ _module: "unloaded" }, /loaded module operation/],
     [{ _op: "unknown" }, /loaded module operation/],
     [{ _module: "*" }, /fixed canonical/],
@@ -499,3 +513,259 @@ test("SDK catalog fails closed for empty registries, missing actors and selector
   const badSelector = await sdkEndpoint(t, registry, () => { throw new Error("private selector detail"); });
   assert.deepEqual((await badSelector("tools/list", "north")).response.result.tools, []);
 });
+
+type WriteDefinition = Extract<XpellMCPExposureDefinition, { _effect: "write" }>;
+const writeActor = (account = "north"): XpellMCPToolContext => ({
+  _auth: { ...actor(account)._auth, scope: "xpell:write" },
+});
+
+const productArgs = {
+  resource_id: "north-public",
+  product_name: "Synthetic product",
+  labels: ["demo"],
+};
+
+async function actionFixture(t: TestContext) {
+  const base = await fixture(t);
+  const { module, definition } = base;
+  type Action = {
+    request: XpellMCPWritePreparationInput;
+    state: "pending" | "cancelled" | "executing" | "executed";
+  };
+  // In-memory fixture for the existing host Action boundary. It is not ADK.
+  const actions = new Map<string, Action>();
+  let authorized = true;
+  const write: WriteDefinition = {
+    ...definition,
+    _name: "catalog_add_product",
+    _module: MODULE,
+    _op: "add-product",
+    _description: "Prepare a product addition for owner approval.",
+    _effect: "write",
+    _permission: "runtime:write",
+    _input_schema: z.strictObject({
+      resource_id: z.string().max(48),
+      product_name: z.string().min(1).max(64),
+      labels: z.array(z.string().max(12)).max(2),
+    }),
+    _output_schema: z.strictObject({
+      _status: z.literal("pending"),
+      proposal_id: z.string().max(24),
+    }),
+    _authorize: (claims, input) => authorized && claims._account_id === "north" &&
+      (input === undefined || input.resource_id === "north-public"),
+    _prepare: (request) => {
+      assert.equal(request._module, MODULE);
+      assert.equal(request._op, "add-product");
+      assert.ok(Object.isFrozen(request));
+      assert.ok(Object.isFrozen(request._arguments));
+      assert.ok(Object.isFrozen(request._arguments.labels));
+      assert.ok(Object.isFrozen(request._actor));
+      assert.equal(Object.hasOwn(request._actor, "_token"), false);
+      const id = `proposal-${actions.size + 1}`;
+      actions.set(id, { request, state: "pending" });
+      const pending = { _state: "pending" as const, id, confidential: "private action data" };
+      return pending;
+    },
+    _project: (raw) => ({ _status: "pending", proposal_id: (raw as { id: string }).id }),
+  };
+  const lookup = (id: string, context: XpellMCPToolContext) => {
+    const action = actions.get(id);
+    if (!action || action.state !== "pending") throw Error("Action is not pending");
+    if (action.request._actor._user_id !== context._auth?._user_id ||
+        action.request._actor._account_id !== context._auth?._account_id ||
+        !authorized || !module.state) throw Error("Action authorization changed");
+    return action;
+  };
+  const host = {
+    deny: () => { authorized = false; },
+    allow: () => { authorized = true; },
+    cancel(id: string, context: XpellMCPToolContext) {
+      lookup(id, context).state = "cancelled";
+    },
+    async confirm(id: string, context: XpellMCPToolContext, confirmedArguments = productArgs) {
+      const action = lookup(id, context);
+      const request = action.request;
+      assert.deepEqual(confirmedArguments, request._arguments, "Action arguments changed");
+      // Claim synchronously before awaiting the native dispatch.
+      action.state = "executing";
+      await _x.execute({
+        _module: request._module, _op: request._op, _params: { ...request._arguments, _auth: request._actor },
+      });
+      action.state = "executed";
+    },
+  };
+  return { ...base, write, host, actions };
+}
+
+test("native write registration requires a matching effect, permission and host prepare hook", async (t) => {
+  const { registry, write, definition } = await actionFixture(t);
+  assert.throws(() => registry.expose({ ...write, _prepare: undefined } as unknown as WriteDefinition), /host preparation/);
+  assert.throws(() => registry.expose({ ...write, _permission: "runtime:read" } as unknown as WriteDefinition), /write effect/);
+  assert.throws(() => registry.expose({ ...write, _effect: "read" } as unknown as WriteDefinition), /read effect/);
+  assert.throws(() => registry.expose({ ...write, _output_schema: OUTPUT }), /pending result schema/);
+  for (const key of ["confirmed", "_approval", "_action_id", "_binding_hash", "_idempotency_key", "conversation_id"]) {
+    assert.throws(() => registry.expose({
+      ...write, _input_schema: z.strictObject({ nested: z.strictObject({ [key]: z.boolean() }) }),
+    }), /strict, bounded/);
+  }
+  registry.expose(write);
+  assert.throws(() => registry.expose({ ...definition, _op: write._op }), /conflicting effects/);
+  registry.seal();
+  assert.deepEqual(registry.select({}, actor()), []);
+  assert.deepEqual(registry.select({}, {}), []);
+  assert.deepEqual(registry.select({}, writeActor()).map((item) => [item._name, item._permission]),
+    [["catalog_add_product", "runtime:write"]]);
+  for (const context of [actor(), {}, writeActor("south")]) {
+    await assert.rejects(registry.invoke(write._name, productArgs, context), errorCode("E_XMCP_EXPOSURE_FORBIDDEN"));
+  }
+});
+
+test("write selection stays closed on stale state, resource denial and injected control arguments", async (t) => {
+  const { registry, write, host, module, actions } = await actionFixture(t);
+  registry.expose(write);
+  registry.seal();
+  const [listed] = registry.select({}, writeActor());
+  assert.ok(listed);
+  module.state = false;
+  await assert.rejects(registry.invoke(listed._name, productArgs, writeActor()), errorCode("E_XMCP_EXPOSURE_UNAVAILABLE"));
+  module.state = true;
+  markXpellMCPRuntimeStarting("fixture_not_ready");
+  await assert.rejects(registry.invoke(listed._name, productArgs, writeActor()), errorCode("E_XMCP_RUNTIME_NOT_READY"));
+  markXpellMCPRuntimeReady("fixture_ready");
+  host.deny();
+  await assert.rejects(registry.invoke(listed._name, productArgs, writeActor()), errorCode("E_XMCP_EXPOSURE_FORBIDDEN"));
+  host.allow();
+  await assert.rejects(registry.invoke(listed._name, { ...productArgs, resource_id: "south-public" }, writeActor()),
+    errorCode("E_XMCP_EXPOSURE_FORBIDDEN"));
+  for (const args of [
+    { ...productArgs, confirmed: true }, { ...productArgs, _actor: "fixture" },
+    { ...productArgs, _module: "different" }, { ...productArgs, _op: "different" },
+    { ...productArgs, _output: {} }, { ...productArgs, _object: "other" },
+    { ...productArgs, _action_id: "proposal-1" }, { ...productArgs, labels: ["a", "b", "c"] },
+  ]) {
+    await assert.rejects(registry.invoke(listed._name, args, writeActor()), errorCode("E_XMCP_EXPOSURE_INPUT"));
+  }
+  assert.equal(actions.size, 0);
+  assert.equal(module.calls.length, 0);
+});
+
+test("host fixture confirms only the exact proposal once, with cancellation and fresh readback", async (t) => {
+  const { registry, write, definition, host, module } = await actionFixture(t);
+  registry.expose(write);
+  registry.expose({ ...definition, _op: "get-product" });
+  registry.seal();
+  assert.deepEqual(registry.select({}, writeActor()).map(({ _name }) => _name), [write._name]);
+
+  const args = { ...productArgs, labels: [...productArgs.labels] };
+  const cancelled = await registry.invoke(write._name, args, writeActor());
+  assert.deepEqual(cancelled, { _status: "pending", proposal_id: "proposal-1" });
+  host.cancel("proposal-1", writeActor());
+  await assert.rejects(host.confirm("proposal-1", writeActor()), /not pending/);
+  assert.equal(module.products.size, 0);
+
+  const prepared = await registry.invoke(write._name, args, writeActor());
+  assert.deepEqual(prepared, { _status: "pending", proposal_id: "proposal-2" });
+  args.labels.push("changed");
+  assert.equal(module.calls.length, 0);
+  assert.deepEqual(await registry.invoke("catalog_read", { resource_id: productArgs.resource_id }, actor()),
+    { title: "missing" });
+  await assert.rejects(host.confirm("proposal-2", writeActor("south")), /authorization changed/);
+  await assert.rejects(host.confirm("proposal-2", writeActor(), args), /arguments changed/);
+  host.deny();
+  await assert.rejects(host.confirm("proposal-2", writeActor()), /authorization changed/);
+  host.allow();
+  assert.equal(module.products.size, 0);
+
+  const confirmations = await Promise.allSettled([
+    host.confirm("proposal-2", writeActor()), host.confirm("proposal-2", writeActor()),
+  ]);
+  assert.equal(confirmations.filter((result) => result.status === "fulfilled").length, 1);
+  assert.equal(confirmations.filter((result) => result.status === "rejected").length, 1);
+  assert.equal(module.calls.length, 1);
+  assert.equal(module.calls[0]._op, "add-product");
+  assert.deepEqual(module.calls[0]._params?.labels, productArgs.labels);
+  await assert.rejects(host.confirm("proposal-2", writeActor()), /not pending/);
+  assert.deepEqual(await registry.invoke("catalog_read", { resource_id: productArgs.resource_id }, actor()),
+    { title: "Synthetic product" });
+});
+
+test("late, invalid, oversized and failed preparations report a safe uncertain outcome without replay", async (t) => {
+  const { registry, write, module, actions } = await actionFixture(t);
+  let attempts = 0;
+  let late!: () => void;
+  registry.expose({
+    ...write, _name: "lost_response", _prepare: (request) => {
+      attempts++;
+      void write._prepare(request);
+      throw Error("private preparation detail");
+    },
+  });
+  registry.expose({
+    ...write, _name: "late_response", _limits: { _timeout_ms: 30 },
+    _prepare: async (request) => {
+      attempts++;
+      const waiting = new Promise<void>((resolve) => { late = resolve; });
+      await waiting;
+      return write._prepare(request);
+    },
+  });
+  registry.expose({
+    ...write, _name: "terminal_result", _prepare: () => ({ _state: "executed" as "pending" }),
+  });
+  registry.expose({
+    ...write, _name: "unsafe_result",
+    _output_schema: z.strictObject({ _status: z.enum(["pending", "completed"]) }),
+    _project: () => ({ _status: "completed" }),
+  });
+  registry.expose({ ...write, _name: "oversized_result", _limits: { _max_output_bytes: 20 } });
+  registry.seal();
+  for (const name of ["lost_response", "late_response", "terminal_result", "unsafe_result", "oversized_result"]) {
+    await assert.rejects(registry.invoke(name, productArgs, writeActor()), (error) => {
+      errorCode("E_XMCP_EXPOSURE_PREPARATION_UNCERTAIN")(error);
+      assert.match((error as Error).message, /Check the host Action/);
+      return true;
+    });
+  }
+  assert.equal(attempts, 2);
+  assert.equal(actions.size, 3);
+  late();
+  await delay(0);
+  assert.equal(actions.size, 4);
+  assert.equal(module.calls.length, 0);
+});
+
+for (const modern of [false, true]) {
+  test(`write preparation is scope gated through the ${modern ? "2026" : "2025"} SDK HTTP path`, async (t) => {
+    const { registry, write, definition, module, actions, host } = await actionFixture(t);
+    registry.expose(write);
+    registry.expose(definition);
+    registry.seal();
+    const call = await sdkEndpoint(t, registry);
+    const readList = await call("tools/list", "north", {}, modern);
+    const writeList = await call("tools/list", "north-write", {}, modern);
+    assert.deepEqual(readList.response.result.tools.map((tool: { name: string }) => tool.name), ["catalog_read"]);
+    assert.deepEqual(writeList.response.result.tools.map((tool: { name: string }) => tool.name), [write._name]);
+    assert.equal(writeList.response.result.tools[0].annotations.readOnlyHint, false);
+    const invoke = (principal: string, args: object, name = write._name) =>
+      call("tools/call", principal, { name, arguments: args }, modern);
+    for (const [principal, args] of [
+      ["north", productArgs], ["south-write", productArgs], ["north-write", { ...productArgs, confirmed: true }],
+      ["north-write", { ...productArgs, _auth: { _authenticated: true } }],
+      ["north-write", { ...productArgs, resource_id: "south-public" }],
+    ] as const) {
+      const denied = await invoke(principal, args);
+      assert.ok(denied.response.error || denied.response.result?.isError);
+    }
+    const confirm = await invoke("north-write", { proposal_id: "proposal-1" }, "confirm");
+    assert.ok(confirm.response.error || confirm.response.result?.isError);
+    assert.equal(actions.size, 0);
+    const allowed = await invoke("north-write", productArgs);
+    assert.deepEqual(allowed.response.result.structuredContent, { _status: "pending", proposal_id: "proposal-1" });
+    host.deny();
+    const stale = await invoke("north-write", productArgs);
+    assert.ok(stale.response.error || stale.response.result?.isError);
+    assert.equal(actions.size, 1);
+    assert.equal(module.calls.length, 0);
+  });
+}

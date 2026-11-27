@@ -19,15 +19,13 @@ export type XpellMCPExposureLimits = {
   _timeout_ms: number;
 };
 
-export type XpellMCPExposureDefinition = {
+type ExposureDefinition = {
   _module: string;
   _op: string;
   _name: string;
   _description: string;
   _input_schema: z.ZodObject;
   _output_schema: z.ZodObject;
-  _effect: "read";
-  _permission: "runtime:read";
   _groups?: readonly string[];
   _tags?: readonly string[];
   _limits?: Partial<XpellMCPExposureLimits>;
@@ -35,6 +33,26 @@ export type XpellMCPExposureDefinition = {
   _is_available?: (actor: Claims) => boolean;
   _project: (result: unknown) => unknown;
 };
+
+export type XpellMCPWritePreparationInput = Readonly<{
+  _name: string;
+  _module: string;
+  _op: string;
+  _arguments: Payload;
+  _actor: Claims;
+}>;
+
+export type XpellMCPPendingPreparation = Readonly<{ _state: "pending" }>;
+
+export type XpellMCPExposureDefinition = ExposureDefinition & (
+  | { _effect: "read"; _permission: "runtime:read" }
+  | {
+    _effect: "write";
+    _permission: "runtime:write";
+    _prepare: (input: XpellMCPWritePreparationInput) =>
+      XpellMCPPendingPreparation | Promise<XpellMCPPendingPreparation>;
+  }
+);
 
 export type XpellMCPExposureSelection = {
   _groups?: readonly string[];
@@ -74,7 +92,7 @@ const HARD_LIMITS: XpellMCPExposureLimits = {
   _timeout_ms: 10000,
 };
 
-export type ReadExposure = Readonly<XpellMCPExposureDefinition & {
+export type Exposure = Readonly<XpellMCPExposureDefinition & {
   _groups: readonly string[];
   _tags: readonly string[];
   _limits: Readonly<XpellMCPExposureLimits>;
@@ -121,14 +139,18 @@ export function discoverOperations(): readonly XpellMCPDiscoveredOperation[] {
   ));
 }
 
-export function prepareReadExposure(definition: XpellMCPExposureDefinition): ReadExposure {
+export function prepareExposure(definition: XpellMCPExposureDefinition): Exposure {
   const { _module, _op, _name, _description, _effect, _permission } = definition;
   if (!isIdentifier(_module) || !isIdentifier(_op, OPERATION) || !isIdentifier(_name) ||
       typeof _description !== "string" || !_description.trim() || _description.length > 512) {
     throw new Error("Exposure requires a fixed canonical module/op, tool name and description.");
   }
-  if (_effect !== "read" || _permission !== "runtime:read") {
-    throw new Error("Native tool exposure requires read effect and runtime:read permission.");
+  if (!((_effect === "read" && _permission === "runtime:read") ||
+        (_effect === "write" && _permission === "runtime:write"))) {
+    throw new Error("Native tool exposure requires read effect with runtime:read or write effect with runtime:write.");
+  }
+  if (definition._effect === "write" && typeof definition._prepare !== "function") {
+    throw new Error("Native write exposure requires a host preparation hook.");
   }
   if (typeof definition._authorize !== "function" || typeof definition._project !== "function" ||
       (definition._is_available !== undefined && typeof definition._is_available !== "function")) {
@@ -139,8 +161,11 @@ export function prepareReadExposure(definition: XpellMCPExposureDefinition): Rea
   const method = instance instanceof XModule && getModuleOperation(instance, _op);
   if (typeof method !== "function") throw new Error("Exposure target is not a loaded module operation.");
 
-  assertExposureSchema(definition._input_schema);
+  assertExposureSchema(definition._input_schema, _effect === "write");
   assertExposureSchema(definition._output_schema);
+  if (_effect === "write" && !definition._output_schema.shape._status?.safeParse("pending").success) {
+    throw new Error("Native write exposure requires a pending result schema.");
+  }
   const limits = { ...DEFAULT_LIMITS, ...definition._limits };
   for (const key of Object.keys(limits) as (keyof XpellMCPExposureLimits)[]) {
     if (!isBoundedInteger(limits[key], HARD_LIMITS[key]) || limits[key] === 0) {
@@ -168,8 +193,9 @@ function getModuleOperation(module: XModule, op: string): unknown {
 
 export function readExposureActor(context: XpellMCPToolContext | undefined): Claims | undefined {
   const auth = context?._auth;
-  if (auth?._authenticated !== true || typeof auth.scope !== "string" ||
-      auth.scope.length > 1024 || !auth.scope.split(/\s+/).includes("xpell:read")) return;
+  if (auth?._authenticated !== true || typeof auth.scope !== "string" || auth.scope.length > 1024) return;
+  const scopes = auth.scope.split(/\s+/);
+  if (!scopes.includes("xpell:read") && !scopes.includes("xpell:write")) return;
 
   const actor: Record<string, unknown> = { _authenticated: true, scope: auth.scope };
   for (const field of ["_user_id", "_account_id", "_agent_id", "_auth_type", "sub", "client_id", "resource"]) {
@@ -183,21 +209,29 @@ export function readExposureActor(context: XpellMCPToolContext | undefined): Cla
   return Object.freeze(actor);
 }
 
-export function checkReadExposure(tool: ReadExposure, actor: Claims, input?: Payload): void {
+export function hasExposureScope(tool: Exposure, actor: Claims): boolean {
+  return typeof actor.scope === "string" && actor.scope.split(/\s+/).includes(`xpell:${tool._effect}`);
+}
+
+export function checkExposure(tool: Exposure, actor: Claims, input?: Payload): void {
+  const operation = tool._effect === "write" ? "Native write preparation" : "Native read operation";
+  if (!hasExposureScope(tool, actor)) {
+    throw new XError("E_XMCP_EXPOSURE_FORBIDDEN", `Verified ${tool._effect} actor is required.`);
+  }
   if (!getXpellMCPRuntimeReadiness()._ready) {
     throw new XError("E_XMCP_RUNTIME_NOT_READY", "Xpell MCP runtime is not ready.");
   }
   if (_x.getModule(tool._module) !== tool._instance ||
       getModuleOperation(tool._instance, tool._op) !== tool._method) {
-    throw new XError("E_XMCP_EXPOSURE_UNAVAILABLE", "Native read operation is unavailable.");
+    throw new XError("E_XMCP_EXPOSURE_UNAVAILABLE", `${operation} is unavailable.`);
   }
   if (!allows(() => tool._authorize(actor)) ||
       (input !== undefined && !allows(() => tool._authorize(actor, input)))) {
-    throw new XError("E_XMCP_EXPOSURE_FORBIDDEN", "Native read operation is not authorized.");
+    throw new XError("E_XMCP_EXPOSURE_FORBIDDEN", `${operation} is not authorized.`);
   }
   const available = tool._is_available;
   if (available && !allows(() => available(actor))) {
-    throw new XError("E_XMCP_EXPOSURE_UNAVAILABLE", "Native read operation is unavailable.");
+    throw new XError("E_XMCP_EXPOSURE_UNAVAILABLE", `${operation} is unavailable.`);
   }
 }
 
@@ -212,23 +246,28 @@ function allows(check: () => boolean): boolean {
   }
 }
 
-export function parseExposureInput(tool: ReadExposure, input: unknown): Payload {
+export function parseExposureInput(tool: Exposure, input: unknown): Payload {
   const limits = { bytes: tool._limits._max_input_bytes, values: tool._limits._max_input_values };
+  const write = tool._effect === "write";
   try {
     const args = input === undefined ? {} : input;
-    if (isBoundedExposurePayload(args, limits)) {
+    if (isBoundedExposurePayload(args, limits, write)) {
       const parsed = tool._input_schema.safeParse(args);
-      if (parsed.success && isBoundedExposurePayload(parsed.data, limits)) {
+      if (parsed.success && isBoundedExposurePayload(parsed.data, limits, write)) {
         return freezeExposurePayload(parsed.data);
       }
     }
   } catch {
     // Keep client-supplied input and schema diagnostics out of errors.
   }
-  throw new XError("E_XMCP_EXPOSURE_INPUT", "Invalid or oversized native read arguments.");
+  throw new XError("E_XMCP_EXPOSURE_INPUT", invalidInputMessage(tool));
 }
 
-export function exposureInputSchema(tool: ReadExposure): StandardSchemaWithJSON<unknown, Payload> {
+function invalidInputMessage(tool: Exposure): string {
+  return `Invalid or oversized native ${tool._effect} arguments.`;
+}
+
+export function exposureInputSchema(tool: Exposure): StandardSchemaWithJSON<unknown, Payload> {
   return {
     "~standard": {
       ...tool._input_schema["~standard"],
@@ -236,16 +275,18 @@ export function exposureInputSchema(tool: ReadExposure): StandardSchemaWithJSON<
         try {
           return { value: parseExposureInput(tool, input) };
         } catch {
-          return { issues: [{ message: "Invalid or oversized native read arguments." }] };
+          return { issues: [{ message: invalidInputMessage(tool) }] };
         }
       },
     },
   };
 }
 
-export async function runReadExposure(tool: ReadExposure, input: Payload, actor: Claims) {
+export async function runExposure(tool: Exposure, input: Payload, actor: Claims) {
   const deadline = performance.now() + tool._limits._timeout_ms;
-  const timeout = () => new XError("E_XMCP_EXPOSURE_TIMEOUT", "Native read deadline exceeded.");
+  const timeout = () => tool._effect === "write"
+    ? uncertainPreparation()
+    : new XError("E_XMCP_EXPOSURE_TIMEOUT", "Native read deadline exceeded.");
   const checkDeadline = () => {
     if (performance.now() >= deadline) throw timeout();
   };
@@ -254,9 +295,30 @@ export async function runReadExposure(tool: ReadExposure, input: Payload, actor:
     const expired = new Promise<never>((_, reject) => {
       timer = setTimeout(() => reject(timeout()), tool._limits._timeout_ms);
     });
-    const read = async () => {
-      checkReadExposure(tool, actor, input);
+    const invoke = async () => {
+      checkExposure(tool, actor, input);
       checkDeadline();
+
+      if (tool._effect === "write") {
+        try {
+          const proposal = await tool._prepare(Object.freeze({
+            _name: tool._name,
+            _module: tool._module,
+            _op: tool._op,
+            _arguments: input,
+            _actor: actor,
+          }));
+          checkDeadline();
+          if (isPlainRecord(proposal) && proposal._state === "pending" && !reportedNativeFailure(proposal)) {
+            const result = projectExposureResult(tool, proposal);
+            checkDeadline();
+            if (result.structuredContent._status === "pending") return result;
+          }
+        } catch {
+          // A proposal may already be durable even if the caller cannot receive it.
+        }
+        throw uncertainPreparation();
+      }
 
       const command: XCommandData & { _ctx: { _auth: Claims } } = {
         _module: tool._module,
@@ -276,10 +338,17 @@ export async function runReadExposure(tool: ReadExposure, input: Payload, actor:
       checkDeadline();
       return result;
     };
-    return await Promise.race([expired, read()]);
+    return await Promise.race([expired, invoke()]);
   } finally {
     clearTimeout(timer);
   }
+}
+
+function uncertainPreparation(): XError {
+  return new XError(
+    "E_XMCP_EXPOSURE_PREPARATION_UNCERTAIN",
+    "Write preparation outcome is uncertain. Check the host Action before submitting again.",
+  );
 }
 
 function reportedNativeFailure(value: unknown): boolean {
@@ -294,7 +363,7 @@ function nativeReadFailure(): XError {
   return new XError("E_XMCP_EXPOSURE_READ_FAILED", "Native read operation failed.");
 }
 
-function projectExposureResult(tool: ReadExposure, value: unknown) {
+function projectExposureResult(tool: Exposure, value: unknown) {
   const limits = { bytes: tool._limits._max_output_bytes, values: tool._limits._max_output_values };
   try {
     const projected = tool._project(value);
