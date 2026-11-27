@@ -23,6 +23,8 @@ Current scope:
 
 The [Xpell2MCP v0.2 contract](docs/xpell2mcp-v0.2.md) documents the opt-in,
 host-controlled native read catalog and how to use it with the existing registry.
+The [v0.3 extension](docs/xpell2mcp-v0.3.md) adds host-owned preparation for
+explicit write targets.
 
 ## Settings
 
